@@ -11,6 +11,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { BookStackClient, BookStackConfig } from "./bookstack-client.js";
+import { DrawingError, drawingErrorText, getDrawing } from "./drawing.js";
 import { registerPrompts } from "./prompts.js";
 import {
   loadOAuthConfig,
@@ -531,6 +532,43 @@ function registerTools(server: McpServer, client: BookStackClient, config: BookS
       return {
         content: [{ type: "text", text: JSON.stringify(attachment) }]
       };
+    }
+  );
+
+  readTool(
+    "get_drawing",
+    {
+      description: "Read one draw.io diagram by image-gallery id. Returns a deterministic drawio-digest/1 text digest always; with include_image=true and a PNG of at most 1 MiB, one additional PNG image block.",
+      inputSchema: {
+        drawing_id: z.coerce.number().int().min(1),
+        include_image: z.boolean().optional().default(false)
+      }
+    },
+    async (args) => {
+      try {
+        const result = await getDrawing(
+          {
+            baseUrl: config.baseUrl,
+            tokenId: config.tokenId,
+            tokenSecret: config.tokenSecret,
+            timeoutMs: config.timeoutMs
+          },
+          args.drawing_id,
+          args.include_image ?? false
+        );
+        const content: Array<
+          { type: "text"; text: string } | { type: "image"; data: string; mimeType: string }
+        > = [{ type: "text", text: result.digest }];
+        if (result.imageBase64 !== null) {
+          content.push({ type: "image", data: result.imageBase64, mimeType: "image/png" });
+        }
+        return { content };
+      } catch (error) {
+        if (error instanceof DrawingError) {
+          return { content: [{ type: "text", text: drawingErrorText(error.code, error.message) }] };
+        }
+        throw error;
+      }
     }
   );
 
