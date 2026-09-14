@@ -538,7 +538,7 @@ function registerTools(server: McpServer, client: BookStackClient, config: BookS
   readTool(
     "get_drawing",
     {
-      description: "Read one draw.io diagram by image-gallery id. Returns a deterministic drawio-digest/1 text digest always; with include_image=true and a PNG of at most 1 MiB, one additional PNG image block.",
+      description: "Read one draw.io diagram by image-gallery id. Returns a deterministic drawio-digest/2 text digest always; with include_image=true and a PNG of at most 1 MiB, one additional PNG image block.",
       inputSchema: {
         drawing_id: z.coerce.number().int().min(1),
         include_image: z.boolean().optional().default(false)

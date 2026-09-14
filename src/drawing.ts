@@ -1,5 +1,6 @@
 /**
- * get_drawing delivery (0004-bookstack-drawing-tool, REQ-BDG-001 clauses 1-8).
+ * get_drawing delivery (0004-bookstack-drawing-tool, REQ-BDG-001 clauses 1-8;
+ * 0005-bookstack-drawing-followup, REQ-BDG-001 clause 4: drawio-digest/2).
  *
  * Minimal upstream-PR-shaped addition: exactly one read tool plus its tests.
  * No write-path changes (bookstack-client.ts untouched); no new runtime
@@ -9,6 +10,9 @@
  * Contract reference: docs/changes/0003-bookstack-diagram-access/specs/
  * bookstack-diagram-read.md REQ-BDG-001 clauses 1-8; reference decoder:
  * docs/changes/0003-bookstack-diagram-access/research/probe_png.py.
+ * Digest v2 grammar: 1c-evo-plan change 0005-bookstack-drawing-followup
+ * (REQ-BDG-001 clause 4, ADR 0007 D2-D3): edge-geometry parse, uniqueness-only
+ * `~` inference, verbatim `?@x,y` exposure.
  */
 
 import { createHash } from "node:crypto";
@@ -372,6 +376,15 @@ function extractDiagrams(mxfileXml: string): DiagramBlock[] | null {
   return out;
 }
 
+interface TerminalPoint {
+  /** Raw attribute values, verbatim (never recomputed or rounded). */
+  xRaw: string;
+  yRaw: string;
+  /** Numeric parse for containment; NaN when non-numeric. */
+  x: number;
+  y: number;
+}
+
 interface MxCell {
   id: string;
   value: string | null;
@@ -380,6 +393,79 @@ interface MxCell {
   source: string | null;
   target: string | null;
   style: string | null;
+  sourcePoint: TerminalPoint | null;
+  targetPoint: TerminalPoint | null;
+  geomX: number | null;
+  geomY: number | null;
+  geomW: number | null;
+  geomH: number | null;
+}
+
+function parseFinite(raw: string | undefined): number | null {
+  if (raw === undefined) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Parse one `<mxPoint ... as="sourcePoint"|"targetPoint">` from an attribute
+ * string. Requires both `x` and `y` attributes; raw values kept verbatim.
+ */
+function parseTerminalPoint(attrText: string): TerminalPoint | null {
+  const attrs = parseAttrs(attrText);
+  const xRaw = attrs["x"];
+  const yRaw = attrs["y"];
+  if (xRaw === undefined || yRaw === undefined) return null;
+  return { xRaw, yRaw, x: Number(xRaw), y: Number(yRaw) };
+}
+
+/**
+ * Parse an edge's inner `<mxGeometry>` for stored terminal points and a
+ * vertex's stored bounds. Geometry lives in the model's stored coordinate
+ * space; no parent-offset resolution (the fidelity probe is the check).
+ */
+function parseCellGeometry(inner: string | undefined): {
+  sourcePoint: TerminalPoint | null;
+  targetPoint: TerminalPoint | null;
+  geomX: number | null;
+  geomY: number | null;
+  geomW: number | null;
+  geomH: number | null;
+} {
+  const empty = {
+    sourcePoint: null as TerminalPoint | null,
+    targetPoint: null as TerminalPoint | null,
+    geomX: null as number | null,
+    geomY: null as number | null,
+    geomW: null as number | null,
+    geomH: null as number | null,
+  };
+  if (!inner) return empty;
+  const gm = /<mxGeometry\b([^>]*)(?:\/>|>([\s\S]*?)<\/mxGeometry\s*>)/i.exec(inner);
+  if (!gm) return empty;
+  const gAttrs = parseAttrs(gm[1]);
+  const body = gm[2] ?? "";
+  let sourcePoint: TerminalPoint | null = null;
+  let targetPoint: TerminalPoint | null = null;
+  const pointRe = /<mxPoint\b([^>]*?)\/?>/gi;
+  let pm: RegExpExecArray | null;
+  while ((pm = pointRe.exec(body)) !== null) {
+    const pAttrs = parseAttrs(pm[1]);
+    const kind = pAttrs["as"];
+    if (kind !== "sourcePoint" && kind !== "targetPoint") continue;
+    const pt = parseTerminalPoint(pm[1]);
+    if (!pt) continue;
+    if (kind === "sourcePoint" && sourcePoint === null) sourcePoint = pt;
+    if (kind === "targetPoint" && targetPoint === null) targetPoint = pt;
+  }
+  return {
+    sourcePoint,
+    targetPoint,
+    geomX: parseFinite(gAttrs["x"]),
+    geomY: parseFinite(gAttrs["y"]),
+    geomW: parseFinite(gAttrs["width"]),
+    geomH: parseFinite(gAttrs["height"]),
+  };
 }
 
 function extractCells(modelXml: string): MxCell[] | null {
@@ -389,6 +475,7 @@ function extractCells(modelXml: string): MxCell[] | null {
   let m: RegExpExecArray | null;
   while ((m = re.exec(modelXml)) !== null) {
     const attrs = parseAttrs(m[1]);
+    const geo = parseCellGeometry(m[2]);
     out.push({
       id: attrs["id"] ?? "",
       value: attrs["value"] ?? attrs["label"] ?? null,
@@ -397,6 +484,12 @@ function extractCells(modelXml: string): MxCell[] | null {
       source: attrs["source"] ?? null,
       target: attrs["target"] ?? null,
       style: attrs["style"] ?? null,
+      sourcePoint: geo.sourcePoint,
+      targetPoint: geo.targetPoint,
+      geomX: geo.geomX,
+      geomY: geo.geomY,
+      geomW: geo.geomW,
+      geomH: geo.geomH,
     });
   }
   return out;
@@ -421,6 +514,97 @@ function styleKind(style: string | null): "L" | "V" {
 
 function sha256Hex(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+// ---------------------------------------------------------------------------
+// drawio-digest/2 endpoint resolution (REQ-BDG-001 clause 4 / ADR 0007 D2-D3)
+// ---------------------------------------------------------------------------
+
+interface ContainmentCandidate {
+  id: string;
+  label: string;
+}
+
+/**
+ * Candidate set for uniqueness-only containment: vertex-flagged,
+ * non-annotation cells carrying complete stored x/y/width/height.
+ * Containment is inclusive in the model's stored coordinate space.
+ */
+function containmentCandidates(cells: MxCell[], byId: Map<string, string>): ContainmentCandidate[] {
+  const out: ContainmentCandidate[] = [];
+  for (const cell of cells) {
+    if (!cell.vertex) continue;
+    if (styleKind(cell.style) !== "V") continue;
+    if (
+      cell.geomX === null ||
+      cell.geomY === null ||
+      cell.geomW === null ||
+      cell.geomH === null
+    ) {
+      continue;
+    }
+    out.push({ id: cell.id, label: byId.get(cell.id) ?? cell.id });
+  }
+  return out;
+}
+
+function pointInside(px: number, py: number, cell: MxCell): boolean {
+  if (
+    cell.geomX === null ||
+    cell.geomY === null ||
+    cell.geomW === null ||
+    cell.geomH === null
+  ) {
+    return false;
+  }
+  if (!Number.isFinite(px) || !Number.isFinite(py)) return false;
+  return (
+    px >= cell.geomX &&
+    px <= cell.geomX + cell.geomW &&
+    py >= cell.geomY &&
+    py <= cell.geomY + cell.geomH
+  );
+}
+
+/**
+ * Resolve one endpoint token per the /2 precedence (source/target independent):
+ * 1. referenced -> label (or raw id); stored point ignored.
+ * 2. inferred `~label` when the attribute is absent and the stored terminal
+ *    point lies inside exactly one candidate vertex.
+ * 3. exposed `?@x,y` (raw verbatim) when no unique containment holds and the
+ *    point exists.
+ * 4. unknown `?`.
+ * Zero or multiple candidates never infer; no distance/tolerance heuristic.
+ */
+function resolveEndpointToken(
+  ref: string | null,
+  point: TerminalPoint | null,
+  cells: MxCell[],
+  byId: Map<string, string>,
+): string {
+  if (ref) {
+    const label = byId.get(ref) ?? ref;
+    return label === "-" ? ref : label;
+  }
+  if (point !== null) {
+    const holders = cells.filter(
+      (c) =>
+        c.vertex &&
+        styleKind(c.style) === "V" &&
+        c.geomX !== null &&
+        c.geomY !== null &&
+        c.geomW !== null &&
+        c.geomH !== null &&
+        pointInside(point.x, point.y, c),
+    );
+    if (holders.length === 1) {
+      const only = holders[0];
+      const label = byId.get(only.id) ?? only.id;
+      return `~${label === "-" ? only.id : label}`;
+    }
+    return `?@${point.xRaw},${point.yRaw}`;
+  }
+  return "?";
 }
 
 // ---------------------------------------------------------------------------
@@ -484,12 +668,8 @@ export function emitDigest(
     );
     for (const cell of cells) {
       if (cell.edge) {
-        const rawS = cell.source ?? null;
-        const rawT = cell.target ?? null;
-        let s = rawS ? (byId.get(rawS) ?? rawS) : "?";
-        let t = rawT ? (byId.get(rawT) ?? rawT) : "?";
-        if (s === "-") s = rawS ?? "?";
-        if (t === "-") t = rawT ?? "?";
+        const s = resolveEndpointToken(cell.source ?? null, cell.sourcePoint, cells, byId);
+        const t = resolveEndpointToken(cell.target ?? null, cell.targetPoint, cells, byId);
         bodyLines.push(`E ${cell.id} ${s} -> ${t} ${normalizeLabel(cell.value)}`);
       } else if (cell.vertex) {
         bodyLines.push(`${styleKind(cell.style)} ${cell.id} ${normalizeLabel(cell.value)}`);
@@ -537,7 +717,7 @@ export function emitDigest(
   }
 
   const head = [
-    "# drawio-digest/1",
+    "# drawio-digest/2",
     `drawing ${drawingId} page ${pageId} png-bytes ${pngBytes.length} png-sha256 ${pngSha256} diagrams ${diagrams.length} truncated ${truncated ? "true" : "false"}`,
   ];
   if (imageOmitted) head.push("image-omitted: png-over-cap");

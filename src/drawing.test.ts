@@ -104,7 +104,7 @@ test("digest is deterministic and line-ordered (V/L/E in document order)", async
   assert.equal(first.digest, second.digest);
   assert.equal(first.imageBase64, null);
   const lines = first.digest.split("\n");
-  assert.equal(lines[0], "# drawio-digest/1");
+  assert.equal(lines[0], "# drawio-digest/2");
   assert.equal(
     lines[1],
     `drawing 265 page 70 png-bytes ${SMALL_PNG.length} png-sha256 ${SMALL_SHA} diagrams 1 truncated false`,
@@ -296,4 +296,83 @@ test("image block: shape for a <= 1 MiB PNG, omit line above the cap", async () 
   );
   assert.equal(big.imageBase64, null);
   assert.ok(big.digest.includes("image-omitted: png-over-cap"));
+});
+
+// ---------------------------------------------------------------------------
+// drawio-digest/2 endpoint grammar (0005-bookstack-drawing-followup,
+// REQ-BDG-001 clause 4): attribute precedence, unique containment inference,
+// ambiguity exposure, verbatim coordinates, missing point.
+// ---------------------------------------------------------------------------
+
+function digestFor(cells: string): string {
+  const png = makePng([chunk("tEXt", textPayload("mxfile", mxfileXml(modelXml(cells))))]);
+  return emitDigest(1, 1, new Uint8Array(png), false).digest;
+}
+
+test("/2: attribute precedence ignores stored terminal points", () => {
+  const digest = digestFor(
+    `<mxCell id="v1" value="A" vertex="1" parent="1"><mxGeometry height="50" width="80" x="100" y="100" as="geometry"/></mxCell>` +
+      `<mxCell id="e1" value="" edge="1" parent="1" source="v1"><mxGeometry relative="1" as="geometry"><mxPoint x="999" y="999" as="sourcePoint"/><mxPoint x="888" y="888" as="targetPoint"/></mxGeometry></mxCell>`,
+  );
+  assert.ok(digest.includes("E e1 A -> ?@888,888 -"));
+});
+
+test("/2: unique containment infers ~label", () => {
+  const digest = digestFor(
+    `<mxCell id="v1" value="УТ 11.5" vertex="1" parent="1"><mxGeometry height="50" width="80" x="120" y="90" as="geometry"/></mxCell>` +
+      `<mxCell id="v2" value="БП3" vertex="1" parent="1"><mxGeometry height="50" width="80" x="370" y="280" as="geometry"/></mxCell>` +
+      `<mxCell id="e1" value="утбп3р" edge="1" parent="1" target="v2"><mxGeometry relative="1" as="geometry"><mxPoint x="200" y="111" as="sourcePoint"/><mxPoint x="410" y="274" as="targetPoint"/></mxGeometry></mxCell>`,
+  );
+  assert.ok(digest.includes("E e1 ~УТ 11.5 -> БП3 утбп3р"));
+});
+
+test("/2: zero candidates expose verbatim ?@x,y", () => {
+  const digest = digestFor(
+    `<mxCell id="v1" value="A" vertex="1" parent="1"><mxGeometry height="50" width="80" x="100" y="100" as="geometry"/></mxCell>` +
+      `<mxCell id="e1" value="" edge="1" parent="1"><mxGeometry relative="1" as="geometry"><mxPoint x="340" y="420" as="sourcePoint"/><mxPoint x="340" y="70" as="targetPoint"/></mxGeometry></mxCell>`,
+  );
+  assert.ok(digest.includes("E e1 ?@340,420 -> ?@340,70 -"));
+});
+
+test("/2: multiple candidates never infer", () => {
+  const digest = digestFor(
+    `<mxCell id="v1" value="A" vertex="1" parent="1"><mxGeometry height="100" width="100" x="0" y="0" as="geometry"/></mxCell>` +
+      `<mxCell id="v2" value="B" vertex="1" parent="1"><mxGeometry height="100" width="100" x="50" y="50" as="geometry"/></mxCell>` +
+      `<mxCell id="e1" value="" edge="1" parent="1"><mxGeometry relative="1" as="geometry"><mxPoint x="75" y="75" as="sourcePoint"/></mxGeometry></mxCell>`,
+  );
+  assert.ok(digest.includes("E e1 ?@75,75 -> ? -"));
+});
+
+test("/2: missing terminal point stays ?", () => {
+  const digest = digestFor(
+    `<mxCell id="v1" value="A" vertex="1" parent="1"><mxGeometry height="50" width="80" x="100" y="100" as="geometry"/></mxCell>` +
+      `<mxCell id="e1" value="" edge="1" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>`,
+  );
+  assert.ok(digest.includes("E e1 ? -> ? -"));
+});
+
+test("/2: raw coordinates emitted verbatim, containment inclusive on bounds", () => {
+  const digest = digestFor(
+    `<mxCell id="v1" value="A" vertex="1" parent="1"><mxGeometry height="50" width="80" x="120" y="90" as="geometry"/></mxCell>` +
+      `<mxCell id="e1" value="" edge="1" parent="1"><mxGeometry relative="1" as="geometry"><mxPoint x="200" y="140" as="sourcePoint"/><mxPoint x="120.5" y="90.0" as="targetPoint"/></mxGeometry></mxCell>`,
+  );
+  // (200,140) is the inclusive corner of v1 -> inferred; (120.5,90.0) is
+  // inside v1 too but must be checked independently per endpoint.
+  assert.ok(digest.includes("E e1 ~A -> ~A -"));
+  const exposed = digestFor(
+    `<mxCell id="e2" value="" edge="1" parent="1"><mxGeometry relative="1" as="geometry"><mxPoint x="007" y="09.50" as="sourcePoint"/></mxGeometry></mxCell>`,
+  );
+  assert.ok(exposed.includes("?@007,09.50"));
+});
+
+test("/2: annotation vertices are not containment candidates", () => {
+  const digest = digestFor(
+    `<mxCell id="t1" value="note" style="text;html=1;" vertex="1" parent="1"><mxGeometry height="50" width="80" x="100" y="100" as="geometry"/></mxCell>` +
+      `<mxCell id="e1" value="" edge="1" parent="1"><mxGeometry relative="1" as="geometry"><mxPoint x="120" y="120" as="sourcePoint"/></mxGeometry></mxCell>`,
+  );
+  assert.ok(digest.includes("E e1 ?@120,120 -> ? -"));
+});
+
+test("/2: line 1 version marker", () => {
+  assert.ok(digestFor(`<mxCell id="v1" value="A" vertex="1" parent="1"/>`).startsWith("# drawio-digest/2\n"));
 });
